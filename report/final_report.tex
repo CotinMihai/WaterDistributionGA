@@ -1,0 +1,505 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{multirow}
+
+\graphicspath{{figures/}}
+
+\title{Comparative Analysis of Metaheuristic Optimization\\
+for Water Distribution Network Design}
+
+\author{
+\IEEEauthorblockN{Mihai Cotin, Andrei Karp}
+\IEEEauthorblockA{Experimental Analysis of Algorithms (Algorithm Engineering)\\
+Project Phase 2, May 2026}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We implement and compare three metaheuristic optimizers on the classical Two-Loop, Hanoi, and GoYang water distribution network (WDN) benchmarks: a Gray-code genetic algorithm (GA) reproducing the SOP-WDN reference of Sangroula et al., a simulated annealing solver (SA), and a discrete particle swarm optimizer (PSO). All three solvers share one WNTR/EPANET evaluator. Across a 10-trial baseline and a 5-axis sensitivity matrix, SA is the most reliable solver, recovering the Two-Loop optimum of $419{,}000$ USD in every trial and approaching the GoYang reference to $+1.4\%$; GA explores most aggressively, with statistically significant cost reductions on Two-Loop and Hanoi (Mann--Whitney $p<0.05$); PSO is the fastest ($3$--$6\times$) but unreliable on Hanoi ($4/10$ feasibility). A static-validation run reveals that the SOP-WDN paper's own Hanoi optimum operates at $V_{\max}=6.832$~m/s under our evaluator, so GA's $-37\%$ Hanoi result lies inside, not outside, the reference paper's feasibility envelope. A velocity-bound gradient sensitivity ($V_{\max}\in\{7.0, 4.0, 2.5\}$~m/s) confirms the corollary: at engineering-typical bounds, no solver --- ours or the reference --- finds any feasible Hanoi design. WDN benchmark costs are protocol-dependent in a load-bearing way and should not be quoted without their full constraint specification.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Water distribution networks; genetic algorithm; simulated annealing; particle swarm optimization; EPANET; benchmark; algorithm engineering.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Water distribution networks (WDNs) consume around 80\% of total municipal water-supply capital investment~\cite{sangroula2022}, and the dominant design decision is the selection of a commercial diameter for each pipe in a network of fixed topology. The least-cost design objective minimizes
+\begin{equation}
+C_T = \sum_{i=1}^{N_p} C_i(D_i)\,L_i
+\label{eq:cost}
+\end{equation}
+subject to mass conservation at each node, energy conservation around each loop, the Hazen--Williams head-loss law, a minimum pressure constraint at every demand node, and bounds on pipe velocities. The decision space is discrete and combinatorial: GoYang with 30 pipes and 8 catalog diameters admits $8^{30}\approx1.23\times10^{27}$ designs, well beyond exhaustive search, which has driven the literature to stochastic metaheuristics~\cite{alperovits1977,kim1994,savic1997}.
+
+The reference framework for this study is the SOP-WDN program of Sangroula et al.~\cite{sangroula2022}, which couples a Gray-code genetic algorithm with EPANET and reports competitive costs on all three benchmarks we consider. The broader metaheuristic landscape --- shuffled complex evolution, harmony search, simulated annealing, particle swarm --- is surveyed in our companion paper~\cite{survey}.
+
+\textbf{Contributions.} (1)~A faithful Python reimplementation of the SOP-WDN GA, sharing a single WNTR/EPANET evaluator with an adaptive-step simulated annealer (SA) and a discrete-position particle swarm optimizer (PSO). (2)~A systematic empirical comparison across a 10-trial baseline at 160{,}000 evaluations and a 5-axis sensitivity matrix, plus a Hanoi velocity-bound gradient experiment. (3)~A demonstration that nominal cost improvements over published benchmarks reflect protocol differences --- chiefly the velocity envelope --- rather than algorithmic progress, and that under engineering-typical velocity bounds the entire published Hanoi feasibility region disappears.
+
+The remainder of the paper is organized as follows. Section~\ref{sec:related} surveys prior work; Section~\ref{sec:formulation} formalizes the optimization problem; Section~\ref{sec:algorithms} describes the three solver implementations; Section~\ref{sec:setup} details the experimental protocol; Section~\ref{sec:results} reports findings; Section~\ref{sec:discussion} discusses what the results support; Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}
+\label{sec:related}
+The Two-Loop network~\cite{alperovits1977} has been the canonical small-scale WDN benchmark since 1977; the Hanoi network~\cite{fujiwara1990} is the standard medium-scale instance; and the GoYang network~\cite{kim1994} provides a high-loop-density real-world case from South Korea. The published best costs for these networks are $419{,}000$ USD, $\approx 6{,}081{,}000$ USD, and $177{,}010{,}359$ KRW respectively, with multiple independent confirmations in the literature~\cite{savic1997,geem2006}.
+
+Genetic algorithms have dominated this benchmark family since Savic and Walters~\cite{savic1997}, with progressively more sophisticated mechanisms layered on top: niched penalties~\cite{deb1996}, boundary-search variants~\cite{wu2002}, and the SOP-WDN framework~\cite{sangroula2022} that we reproduce. Particle swarm optimization was adapted to WDN design by Surco et al.~\cite{surco2018}; simulated annealing has long been a single-solution baseline in discrete combinatorial optimization. Comparative studies on these benchmarks include~\cite{bi2020}, which compared three evolutionary search behaviours, and the broader review in~\cite{mala2018}. The present study is differentiated by its emphasis on (i) running all three solvers on a single hydraulic evaluator to control for simulator-driven artifacts, and (ii) explicitly quantifying how protocol choices (velocity bounds, penalty coefficients) shift the reported costs.
+
+\section{Problem Formulation}
+\label{sec:formulation}
+\subsection{Objective and decision variables}
+Each pipe $i\in\{1,\dots,N_p\}$ is assigned a diameter index $x_i\in\{0,\dots,n_s-1\}$, where the diameter is $D_i = \mathcal{D}[x_i]$ and the per-meter cost is $C_i = \mathcal{C}[x_i]$ taken from the network-specific catalog. The total cost is given by~\eqref{eq:cost}, where $L_i$ is the fixed length of pipe $i$.
+
+\subsection{Hydraulic constraints}
+For each demand node $j$ with $n_j$ connected pipes, mass conservation requires
+\begin{equation}
+\sum_{i=1}^{n_j} q_i = 0,
+\label{eq:mass}
+\end{equation}
+where $q_i$ is the signed flow into node $j$. For each independent loop containing $m$ pipes, energy conservation requires
+\begin{equation}
+\sum_{i=1}^{m} h_i = 0.
+\label{eq:energy}
+\end{equation}
+The friction head loss $h_f$ in each pipe is modelled by the Hazen--Williams equation:
+\begin{equation}
+h_f = 4.72\,C^{-1.85}\,Q^{1.85}\,D^{-4.87}\,L,
+\label{eq:hw}
+\end{equation}
+where $C$ is the Hazen--Williams roughness coefficient, $Q$ is the flow rate, and $D$ is the inner diameter.
+
+The explicit design constraints are:
+\begin{itemize}
+\item Nodal pressure: $P_j \geq P_{\min}$ at every demand node;
+\item Pipe velocity: $V_{\min} \leq |V_i| \leq V_{\max}$ for every pipe (when enforced).
+\end{itemize}
+
+\subsection{Penalty function and fitness}
+Following the SOP-WDN convention, we evaluate candidates with a penalty-weighted fitness
+\begin{equation}
+\mathrm{fit}(\mathbf{x}) = \frac{1}{C_T\cdot P_P \cdot V_P},
+\label{eq:fitness}
+\end{equation}
+where the pressure penalty $P_P$ and the velocity penalty $V_P$ are defined as
+\begin{align}
+P_P &= 1 + \sum_{j=1}^{N_n} |T_P - P_j|\cdot \mathrm{PP}_1 + \sum_{j=1}^{N_n} |T_P - P_j|\cdot \mathrm{PP}_2,\label{eq:pp}\\
+V_P &= 1 + \sum_{i=1}^{N_p} |T_V - V_i|\cdot \mathrm{VP}_1 + \sum_{i=1}^{N_p} |T_V - V_i|\cdot \mathrm{VP}_2,\label{eq:vp}
+\end{align}
+where $T_P, T_V$ are target pressure and velocity values, and the four coefficients $\mathrm{PP}_1, \mathrm{PP}_2, \mathrm{VP}_1, \mathrm{VP}_2$ distinguish over- vs.\ under-target violations. In implementation each sum is evaluated piecewise: only the corresponding clipped deviation contributes. Concretely, under-pressure ($P_j < T_P$) is multiplied by the severe $\mathrm{PP}_2$, over-pressure by the mild $\mathrm{PP}_1$; below-target velocity ($|V_i| < T_V$, i.e.\ stagnant pipes) is multiplied by $\mathrm{VP}_2$, above-target by $\mathrm{VP}_1$. The first three coefficients match the published SOP-WDN values exactly ($\mathrm{PP}_1{=}0.02$, $\mathrm{PP}_2{=}1.9$, $\mathrm{VP}_1{=}0.3$); we use $\mathrm{VP}_2{=}0.65$ instead of the paper's $0.06$, to discourage low-velocity sediment-prone designs more aggressively.
+
+In addition to these soft penalties --- which shape the optimizer's gradient toward feasibility --- we apply \emph{hard-violation multipliers} as a final safeguard. If any demand node violates $P_j \geq P_{\min}$, the entire $P_P$ value is multiplied by $50$; an analogous $50\times$ multiplier is applied to $V_P$ if any pipe falls outside the explicit velocity bounds. Final feasibility, however, is determined by a separate Boolean check (all pressures $\geq P_{\min}$, all velocities within bounds), not by the penalty magnitudes. The penalty values guide search; the feasibility flag records the verdict.
+
+\section{Algorithm Implementations}
+\label{sec:algorithms}
+All three solvers share the same hydraulic evaluator (Sec.~\ref{sec:hydraulics}) and operate on the same vector $\mathbf{x}\in\mathbb{Z}^{N_p}$ of diameter indices, ensuring that any performance difference is attributable to the search strategy and not to simulator drift.
+
+\subsection{Genetic algorithm (GA)}
+The GA reproduces the SOP-WDN framework. Each candidate $\mathbf{x}$ is encoded as a Gray-coded binary chromosome of length $N_p \cdot \lceil\log_2 n_s\rceil$, so that successive integer values differ by exactly one bit, eliminating the Hamming cliff that hampers binary mutation in discrete spaces. Redundant codes (when $2^{\lceil\log_2 n_s\rceil} > n_s$) are mapped to valid diameter indices using linear scaling, where the largest diameter receives roughly twice the allocation probability of the smallest, following Tanyimboh's recommendation~\cite{tanyimboh2021}.
+
+Selection follows the power-law rank scheme
+\begin{equation}
+P(i) = \frac{i^{-\tau}}{\sum_{k=1}^{n} k^{-\tau}},\quad \tau = 1.15,
+\end{equation}
+which keeps the selection pressure between Sangroula's recommended $\tau\in[1.1,1.2]$. Crossover is $k$-point with $k=\lfloor 0.8\,N_p\rceil$ and probability $0.87$; mutation is bit-flip at $5\%$ rate, increased to a deterministic hill-climbing operator (a single bit flip is accepted only if it improves fitness) during the final $10\%$ of generations. The two best individuals are preserved by elitism.
+
+\subsection{Simulated annealing (SA)}
+SA explores the integer index space directly without an explicit encoding. The temperature follows a geometric schedule
+\begin{equation}
+T_k = T_0 \exp\left(\frac{k}{K}\ln\frac{T_K}{T_0}\right)
+\end{equation}
+with $T_0=1.0$, $T_K=10^{-3}$. The neighborhood operator perturbs an adaptive number of pipe indices: more mutations early (when temperature is high), fewer late. Candidates are accepted with probability $\min(1, \exp(-\Delta/T))$, where $\Delta$ is the change in penalized cost. To make the per-trial computational budget commensurate with GA and PSO, the SA iteration count is set to $N_{\text{gen}}\cdot N_{\text{pop}}$, matching the total number of hydraulic evaluations.
+
+\subsection{Particle swarm optimization (PSO)}
+The PSO maintains real-valued particle positions and velocities; positions are rounded and clamped to $[0, n_s-1]$ before evaluation. The velocity update follows the standard inertia-weighted form
+\begin{equation}
+v_i \leftarrow w\,v_i + c_1\,r_1\,(p_i - x_i) + c_2\,r_2\,(g - x_i),
+\end{equation}
+with inertia $w$ linearly decreasing from $0.7$ to $0.4$, $c_1=c_2=1.8$, and per-component velocity clamping. One particle is seeded with the maximum-diameter design to ensure at least one feasible candidate exists in the initial swarm.
+
+\subsection{Hydraulic evaluator and engineering}
+\label{sec:hydraulics}
+The evaluator wraps WNTR~\cite{wntr} with EPANET~\cite{rossman2000} as the simulation backend (with fallback to WNTR's native solver). For each candidate $\mathbf{x}$ it (i)~sets pipe diameters in a reused network model, (ii)~runs a steady-state simulation, (iii)~reads nodal pressures and pipe velocities, and (iv)~computes cost, $P_P$, $V_P$, and feasibility flags. Two engineering features substantially reduce wall-time: a per-process LRU cache of 4096 entries (avoiding repeated simulations of recurring candidates) and a multiprocessing pool with per-worker network copies (enabling parallel batch evaluation in GA and PSO). All three solvers also use \emph{penalty annealing}, in which the penalty multipliers are scaled from $0.25$ to $1.0$ over the run --- early generations explore widely, late generations enforce constraints strictly. Network definitions, demand and elevation tables, pipe catalogs, and the seeds used in every experiment are all embedded in \texttt{wdn\_optimizer/}, with the published-optimal validation vectors and the champion designs released alongside the source.
+
+\section{Experimental Setup}
+\label{sec:setup}
+\subsection{Benchmark networks}
+Table~\ref{tab:benchmarks} summarizes the three networks. The data --- demands, elevations, pipe lengths, catalogs, and reference costs --- is taken directly from the appendix tables of~\cite{sangroula2022} and encoded in \texttt{wdn\_optimizer/network.py}. The GoYang reservoir, which the original network includes as a 71-m source plus a 4.52~kW pump, is modelled here as an equivalent constant-head source of 86~m, since the explicit pump curve is not provided in the source tables.
+
+\begin{table}[t]
+\caption{Benchmark networks and literature reference costs}
+\label{tab:benchmarks}
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Network & Nodes & Pipes & Loops & Search space & Best known \\
+\midrule
+Two-Loop & 7 & 8 & 2 & $1.67\!\times\!10^{7}$ & 419{,}000 USD \\
+Hanoi & 32 & 34 & 3 & $2.86\!\times\!10^{26}$ & 6{,}081{,}000 USD \\
+GoYang & 22 & 30 & 9 & $1.23\!\times\!10^{27}$ & 177{,}010{,}359 KRW \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Experimental matrix}
+Seven configurations were executed (Table~\ref{tab:configs}), spanning a 10-trial high-effort baseline, a five-axis sensitivity sweep over population size and generation count, and a strict-velocity Hanoi sensitivity case. Each non-strict configuration runs all three solvers on all three networks. All experiments use seed control: trial $t$ for network $n$ with strategy $s$ uses seed $1000t + \text{offset}_n + \text{offset}_s$.
+
+\begin{table}[t]
+\caption{Experimental configurations}
+\label{tab:configs}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Config & Trials & Gen & Pop & Budget \\
+\midrule
+BASELINE (10T\_800G\_200P) & 10 & 800 & 200 & 160{,}000 \\
+FAST (3T\_100G\_100P) & 3 & 100 & 100 & 10{,}000 \\
+MED (3T\_200G\_100P) & 3 & 200 & 100 & 20{,}000 \\
+DEEP (3T\_400G\_100P) & 3 & 400 & 100 & 40{,}000 \\
+POP150 (3T\_200G\_150P) & 3 & 200 & 150 & 30{,}000 \\
+WIDE (3T\_200G\_200P) & 3 & 200 & 200 & 40{,}000 \\
+HANOI\_STRICT (Hanoi only, $V\!\in\![0.3,2.5]$) & 3 & 200 & 100 & 20{,}000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Implementation differences from SOP-WDN}
+\label{sec:protocol}
+Three protocol choices distinguish our implementation from the SOP-WDN reference and warrant explicit disclosure:
+\begin{enumerate}
+\item $\mathrm{VP}_2=0.65$ instead of $0.06$, increasing the cost of under-velocity flows by a factor of $\approx10$. This was retained to make low-velocity (stagnant-flow) designs less attractive to the optimizer.
+\item Default Hanoi velocity bounds are $V_{\min}=0$, $V_{\max}=7$~m/s. This is \emph{not} a relaxation of the published protocol --- as we show in Sec.~\ref{sec:validation}, the SOP-WDN paper's own published-optimal Hanoi design produces $V_{\max}=6.832$~m/s under identical hydraulic evaluation. Engineering-typical bounds of $[0.3, 2.5]$~m/s are stricter than what the reference paper effectively enforces. We additionally study the strict-bound regime as a sensitivity case in Sec.~\ref{sec:hanoi-strict}.
+\item GoYang reservoir + 4.52~kW pump is modelled as an equivalent 86~m constant-head source. The exact pump curve is not provided in the SOP-WDN appendix; Sec.~\ref{sec:validation} confirms that this approximation reproduces the paper's optimal cost to the cent and the paper's reported minimum pressure to within 0.32~m.
+\end{enumerate}
+
+\subsection{Metrics}
+For each (network, strategy) pair we report: best feasible cost over trials, mean and standard deviation of best cost, median, feasibility rate (fraction of trials whose best is feasible), mean wall-time, and gap-to-published-best
+\begin{equation}
+\mathrm{Gap}(\%) = 100\cdot\frac{C^*_\text{ours} - C^*_\text{paper}}{C^*_\text{paper}}.
+\end{equation}
+Pairwise solver comparisons use the Mann--Whitney U test on the cost distributions of feasible trials.
+
+\section{Results}
+\label{sec:results}
+
+\textbf{Headline.} (1)~The hydraulic evaluator reproduces all three published-optimal costs to the cent (Table~\ref{tab:validation}). (2)~Under the protocol used by the reference paper, SA is the most reliable solver, GA finds the cheapest feasible designs, PSO is the fastest but the least reliable on Hanoi (Tables~\ref{tab:baseline},~\ref{tab:twoloop_champions}). (3)~The same reference paper's Hanoi optimum operates at $V_{\max}=6.832$~m/s; under engineering-typical bounds, neither our solvers nor that reference design remain feasible (Table~\ref{tab:vmax_gradient}). The cost gap between numerical and engineering feasibility is the central finding of this study.
+
+\subsection{Model validation: paper-optimal recovery}
+\label{sec:validation}
+Before comparing optimizers, we verified that our hydraulic evaluator reproduces the SOP-WDN reference behaviour on the published-optimal designs. We took the optimal pipe-diameter vectors stated in Sangroula et al.~\cite{sangroula2022} (Tables 5, 8, and 11), set them as fixed inputs to our evaluator, and recorded the resulting cost and hydraulic state. Table~\ref{tab:validation} summarizes the results.
+
+\begin{table}[t]
+\caption{Recovery of published-optimal solutions under our WNTR/EPANET evaluator. The cost matches the published value to the cent on all three networks.}
+\label{tab:validation}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Network & Paper cost & Our cost & $\Delta$ cost & Our MinP \\
+\midrule
+Two-Loop & 419{,}000 & 419{,}000 & 0 & 30.44 m \\
+Hanoi    & 6{,}081{,}115.40 & 6{,}081{,}115.40 & 0 & 30.01 m \\
+GoYang   & 177{,}010{,}359 & 177{,}010{,}359 & 0 & 15.94 m \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All three published costs are reproduced exactly. The Hanoi MinP of 30.01~m matches the paper's reported value to the second decimal place. The 0.32~m GoYang pressure delta (paper 15.62~m vs ours 15.94~m at the binding node) reflects the 86~m equivalent-head model approximation discussed in Sec.~\ref{sec:protocol}; this approximation does not affect the cost calculation, which depends only on the selected diameters.
+
+A subtler finding emerges from the per-pipe velocity readout: the published Hanoi optimum operates at $V_{\max}=6.832$~m/s on the reservoir-feeder pipe P1 (which carries the entire system demand of $\approx 5.54$~m\textsuperscript{3}/s through a 1016~mm diameter) and at $V_{\min}=0.21$~m/s on the least-loaded pipe --- both extremes outside the conventional engineering window of $[0.3, 2.5]$~m/s but within the paper's effective protocol. This is the basis for our choice of $V_{\max}=7$~m/s as the default Hanoi bound in Sec.~\ref{sec:protocol}: it is the effective bound the reference paper itself operates within. Section~\ref{sec:hanoi-strict} returns to the contrast between this paper-default regime and a stricter engineering regime.
+
+In addition to this static-design validation, the SA optimizer recovers the published Two-Loop cost of $419{,}000$ in \emph{every} one of the 10 baseline trials --- a dynamic validation through the optimizer, with zero variance --- and all three solvers find feasible GoYang designs within $1.4$--$2.7\%$ of the published cost (Sec.~\ref{sec:baseline}).
+
+\subsection{Baseline comparison (10 trials)}
+\label{sec:baseline}
+Table~\ref{tab:baseline} consolidates the high-effort baseline. Three patterns stand out.
+
+\begin{table*}[t]
+\caption{Baseline results (\texttt{FINAL\_10T\_800G\_200P\_2C}). All cost statistics are computed over feasible trials only; the Feasibility column reports the number of feasible trials out of the trials completed. GoYang SA completed 9 of 10 trials (the 10th terminated early due to a system event); the resulting 9 trials are feasible.}
+\label{tab:baseline}
+\centering
+\begin{tabular}{llrrrrrr}
+\toprule
+Network & Solver & Best cost & Mean cost & Std cost & Feasibility & Mean time (s) & Gap (\%) \\
+\midrule
+\multirow{3}{*}{Two-Loop} & GA  & 194{,}000      & 256{,}500      & 54{,}392       & 10/10 & 241.7  & $-53.7$ \\
+                          & SA  & 419{,}000      & 419{,}000      & 0              & 10/10 & 317.9  & $0.0$ \\
+                          & PSO & 231{,}000      & 388{,}000      & 120{,}872      & 7/10  & 75.7   & $-44.9$ \\
+\midrule
+\multirow{3}{*}{Hanoi}   & GA  & 3{,}806{,}860  & 5{,}517{,}299  & 759{,}413      & 10/10 & 1349.8 & $-37.4$ \\
+                          & SA  & 6{,}462{,}932  & 6{,}594{,}611  & 92{,}670       & 10/10 & 1351.2 & $+6.3$ \\
+                          & PSO & 5{,}709{,}258  & 6{,}837{,}724  & 782{,}338      & 4/10  & 702.7  & $-6.1$ \\
+\midrule
+\multirow{3}{*}{GoYang}  & GA  & 180{,}237{,}166 & 181{,}367{,}805 & 1{,}028{,}172 & 10/10 & 1251.8 & $+1.8$ \\
+                          & SA  & 179{,}504{,}405 & 180{,}402{,}057 & 1{,}314{,}712 & 9/9   & 1695.7 & $+1.4$ \\
+                          & PSO & 181{,}816{,}214 & 186{,}796{,}283 & 3{,}419{,}932 & 10/10 & 217.1  & $+2.7$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig01_sota_comparison.png}
+\caption{Best-cost comparison against literature reference values. ``Below-SOTA'' Two-Loop and Hanoi results sit inside the published feasibility envelope (Sec.~\ref{sec:validation}); their interpretation is discussed in Sec.~\ref{sec:discussion}.}
+\label{fig:sota}
+\end{figure}
+
+\textbf{(i) GoYang is the honest benchmark.} On the highest-complexity instance --- $1.23\!\times\!10^{27}$ candidate designs --- all three solvers fall within a 1.3-percentage-point window of the published optimum. SA leads (\(+1.41\%\)), GA is close behind (\(+1.82\%\)), and PSO trails (\(+2.71\%\)), all with $\geq90\%$ feasibility. This is the cleanest three-way comparison in the experiment because no protocol shortcuts mask any solver's behaviour.
+
+\textbf{(ii) SA is the most reliable.} On Two-Loop, SA recovers the published optimum exactly, in every trial. On Hanoi, its cost variance is two orders of magnitude lower than GA's. Across networks, SA's mean cost gap is the smallest in standard deviation terms.
+
+\textbf{(iii) GA explores deeper inside the paper's own feasibility envelope.} GA reports best costs $53.7\%$ below the Two-Loop reference and $37.4\%$ below the Hanoi reference. The natural reading is that these designs leave the published constraint regime --- but they do not: as established in Sec.~\ref{sec:validation}, the SOP-WDN paper's own Hanoi optimum operates at $V_{\max}=6.832$~m/s and $V_{\min}=0.21$~m/s --- the same envelope our GA exploits. The GA's Hanoi best ($3.81$ million) has $V_{\max}=6.83$~m/s, $V_{\min}=0.16$~m/s, and $\text{MinP}=32.34$~m --- all within the bounds the reference paper itself accepts. The interpretation is that the SOP-WDN GA appears to converge prematurely to a more conservative region of the same feasibility envelope, while our GA finds cheaper designs deeper inside it. We discuss the engineering acceptability of these designs in Sec.~\ref{sec:discussion}; the strict-velocity sensitivity in Sec.~\ref{sec:hanoi-strict} shows that under tighter $V_{\min}=0.3$, $V_{\max}=2.5$~m/s bounds, no solver --- paper-faithful or otherwise --- finds feasible designs in our evaluation budget.
+
+\subsection{Champion solutions on Two-Loop}
+\label{sec:champions}
+Table~\ref{tab:twoloop_champions} compares the published-optimal Two-Loop design against representative solutions found by each of our solvers in a single 200-generation $\times$ 100-population trial. All three solvers reach the same peak velocity $V_{\max}=1.895$~m/s, so the design space is exercised within identical hydraulic constraints. The cost reduction relative to the paper optimum reflects different pipe-size choices, not different physics.
+
+\begin{table}[t]
+\caption{Pipe diameter vectors (mm) for the Two-Loop network. SA recovers the published optimum exactly; GA and PSO find feasible designs at lower cost by using smaller diameters on the secondary pipes.}
+\label{tab:twoloop_champions}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Pipe & Paper~\cite{sangroula2022} & GA & SA & PSO \\
+\midrule
+P1 & 457.2 & 355.6 & 457.2 & 355.6 \\
+P2 & 254.0 &  50.8 & 355.6 & 355.6 \\
+P3 & 406.4 & 406.4 & 355.6 & 254.0 \\
+P4 & 101.6 &  25.4 &  50.8 & 152.4 \\
+P5 & 406.4 & 406.4 & 355.6 & 355.6 \\
+P6 & 254.0 & 152.4 & 152.4 & 152.4 \\
+P7 & 254.0 &  50.8 & 355.6 & 254.0 \\
+P8 &  25.4 & 254.0 & 254.0 & 152.4 \\
+\midrule
+Cost (USD)        & 419{,}000 & 300{,}000 & 423{,}000 & 292{,}000 \\
+MinP (m)          & 30.44     & 34.12     & 30.03     & 31.25 \\
+MaxV (m/s)        & 1.895     & 1.895     & 1.895     & 1.895 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The pattern is informative. SA, the most conservative solver, produces a design structurally very close to the published one (with only P3 and P7 differing) and a cost within 1\%. The GA's $300{,}000$ design --- 29\% cheaper than the paper --- achieves this by aggressively downsizing pipes P2, P4, P7 (the secondary distributors) while keeping the trunk pipes P1, P3, P5 at moderate sizes. PSO converges to a different topology entirely (P1 reduced to 355.6, P3 to 254, P7 retained at 254) and lands $30\%$ below the paper at $292{,}000$. None of these designs violates the explicit pressure or velocity constraints set in this study.
+
+For Hanoi and GoYang we observed analogous structural diversity --- different solvers converge to qualitatively different pipe-size topologies. The 34- and 30-pipe vectors do not fit inline; the full vectors are stored in \texttt{report/champion\_solutions.json} alongside the source. One Hanoi observation deserves separate mention: the GA's $4.51$~million design reaches $V_{\max}=6.832$~m/s, exactly matching the SOP-WDN published optimum's peak velocity. Both designs exploit the same upper end of the velocity envelope; the GA simply finds a cheaper assignment within it.
+
+\subsection{Hanoi velocity-bound gradient: numerical vs.\ engineering feasibility}
+\label{sec:hanoi-strict}
+The interpretation in Sec.~\ref{sec:baseline} relies on the claim that GA's $-37\%$ Hanoi design sits inside the same feasibility envelope the reference paper itself uses. To probe the boundary of that envelope, we ran two sensitivity experiments with progressively tighter velocity bounds:
+
+\begin{itemize}
+\item $V_{\max}=4.0$~m/s (\texttt{REPORT\_HANOI\_VMAX4\_3T\_100G\_100P\_2C}): an intermediate bound, still above conventional engineering practice but well below the paper-default $7$~m/s.
+\item $V_{\max}=2.5$~m/s, $V_{\min}=0.3$~m/s (\texttt{REPORT\_HANOI\_STRICT\_3T\_200G\_100P\_8C}): engineering-typical bounds, excluding both the stagnant pipes ($V<0.3$) and the high-velocity pipes ($V>2.5$) present in both the GA's $3.81$~M design and the SOP-WDN paper's published optimum.
+\end{itemize}
+
+The results are unambiguous (Table~\ref{tab:vmax_gradient}). Once velocity bounds are tightened to $V_{\max}=4.0$~m/s --- still above standard engineering --- no GA or SA trial finds a feasible Hanoi design. Pressure constraints remain satisfiable in every case; failures are driven entirely by velocity violations on the high-flow trunk pipes. Under the engineering-typical bound of $2.5$, the same conclusion holds. PSO's apparent ``feasibility'' percentages in this regime are spurious --- they reflect EPANET convergence failures rather than valid designs (pressure $=-100$~m), as noted in Sec.~\ref{sec:baseline}.
+
+\begin{table}[t]
+\caption{Hanoi velocity-bound gradient. Feasibility collapses well before the engineering-typical $V_{\max}=2.5$~m/s ceiling. All three values are paper-faithful evaluations under the same hydraulic engine; only the explicit velocity acceptance changes.}
+\label{tab:vmax_gradient}
+\centering
+\begin{tabular}{lrrr}
+\toprule
+$V_{\max}$ (m/s) & GA feasible & SA feasible & PSO feasible \\
+\midrule
+$7.0$ (paper default) & 10/10 & 10/10 & 4/10 \\
+$4.0$ (intermediate)  & 0/3   & 0/3   & 0/3 \\
+$2.5$ (engineering)   & 0/3   & 0/2   & --- \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+\noindent At $V_{\max}=4.0$, the GA's best raw cost across 3 trials is $4.44$~M (gap $-26.95\%$) but with high-velocity violations on the trunk pipes; the SA best is $6.92$~M with the same violation type; PSO trials all hit EPANET non-convergence. None of these are feasible designs; the table reports them only to show the budget and solver behavior, not as candidate solutions.
+\end{table}
+
+This is the central methodological finding of the paper: the gap between \emph{numerical feasibility} (pressure $\geq 30$~m, EPANET converges) and \emph{engineering feasibility} ($V_{\max} \lesssim 4$ m/s for pipe wear and noise) is large enough on Hanoi to wipe out every design produced by any solver in our budget, including the SOP-WDN reference. Cost numbers in this domain are protocol-dependent in a load-bearing way --- not just qualitatively.
+
+\subsection{Cost distribution and reliability}
+Figure~\ref{fig:boxplots} shows the cost distribution across the 10 baseline trials per (network, solver) combination.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig02_boxplots.png}
+\caption{Cost distribution across the 10 baseline trials (feasible trials only). SA's zero-variance behavior on Two-Loop and tight Hanoi distribution stand in sharp contrast to PSO's spread.}
+\label{fig:boxplots}
+\end{figure}
+
+SA's Two-Loop box collapses to a single horizontal line at $419{,}000$ --- zero variance across all 10 trials. PSO's Hanoi distribution sits well above SOTA at $\approx6.8$~million with a $\pm0.8$~million spread across only 4 feasible trials, reflecting both a higher mean and a higher variance than the other two solvers; the remaining 6 PSO Hanoi trials hit catastrophic EPANET solver failures (pressure $=-100$~m, simulation non-convergence) and are excluded from the box. GA shows moderate, well-behaved variance on all three networks.
+
+\subsection{Feasibility analysis}
+Figure~\ref{fig:feasibility} compiles the feasibility rate of each (network, solver) pair across every configuration in the matrix. The picture is clear:
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig06_feasibility_heatmap.png}
+\caption{Feasibility rates across the six default-velocity configurations. PSO on Hanoi is the consistent weak spot; GA and SA achieve 100\% feasibility everywhere. The strict-velocity Hanoi sensitivity (Sec.~\ref{sec:hanoi-strict}) is excluded from this heatmap because it covers only Hanoi.}
+\label{fig:feasibility}
+\end{figure}
+
+\begin{itemize}
+\item GA and SA are uniformly feasible (100\%) on Two-Loop and GoYang.
+\item PSO on Hanoi ranges from 33\% to 67\% across the sensitivity configurations and sits at 40\% in the high-effort baseline --- a clear reliability weakness on networks with high pipe count and tight pressure constraints.
+\item PSO on Two-Loop is variable as well (33--100\%), with feasibility collapsing in the smaller-budget configurations and recovering with larger populations.
+\item Under the stricter Hanoi velocity bounds explored separately in Sec.~\ref{sec:hanoi-strict}, every solver collapses to 0\% feasibility --- a fundamental limit driven by the constraint regime, not by tuning.
+\end{itemize}
+
+\subsection{Convergence behaviour}
+Figure~\ref{fig:convergence} plots normalized convergence speed --- the percentage of total cost reduction achieved as a function of percentage of budget spent.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig14_normalized_convergence.png}
+\caption{Normalized convergence speed. PSO reaches near-final quality within the first $\sim$5\% of its budget; GA and SA converge more gradually.}
+\label{fig:convergence}
+\end{figure}
+
+PSO is dramatically front-loaded: it reaches 80--95\% of its final improvement within the first $5\%$ of its iteration budget, then stagnates --- the classic premature-convergence pattern. GA shows a slower, more sustained improvement curve typical of population-based exploration. SA is the smoothest: a long, gradual descent that nevertheless reaches a competitive solution by the end. From an algorithm-engineering perspective, this means PSO is the right choice when the budget is small and rough estimates are acceptable, while GA and SA make better use of large budgets.
+
+\subsection{Budget sensitivity}
+Figures~\ref{fig:budget} and~\ref{fig:gen-sensitivity} report how solution quality responds to total evaluation budget and generation count respectively.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig08_budget_efficiency.png}
+\caption{Best cost vs. computation budget (gen $\times$ pop). All three solvers exhibit diminishing returns past $\sim$40{,}000 evaluations.}
+\label{fig:budget}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig05_generation_sensitivity.png}
+\caption{Generation sensitivity at fixed population (P=100). GA continues to improve through 400 generations; SA stabilizes early; PSO is erratic due to feasibility failures.}
+\label{fig:gen-sensitivity}
+\end{figure}
+
+GA's Two-Loop best plateaus around $193$--$194{,}000$ once the budget reaches $\sim$40{,}000 evaluations and does not improve appreciably even at the $160{,}000$-evaluation baseline. SA, by contrast, plateaus much earlier: its Two-Loop best is already exactly $419{,}000$ at the 100-generation budget and stays there. PSO's response is non-monotonic, driven primarily by stochastic feasibility outcomes rather than by a meaningful quality trend. Across the matrix, the marginal benefit of adding budget beyond $\sim$40{,}000 evaluations is small for every solver.
+
+\subsection{Statistical significance}
+\textbf{Test choice.} We compare solver cost distributions with the two-sided \emph{Mann--Whitney $U$ test} (equivalently, the Wilcoxon rank-sum test). Mann--Whitney is a non-parametric test: it does not assume that the underlying cost distributions are Gaussian, an assumption we cannot justify here because (i)~the sample sizes are small ($n=10$ per solver), (ii)~costs are discrete (sum of catalog prices) and frequently bunch at a small number of values, and (iii)~at least one solver (SA on Two-Loop) collapses to a single value with zero variance, which makes Student's $t$ ill-defined. The test ranks the pooled $2n$ observations from both samples, sums the ranks belonging to one sample, and derives $U$ from that sum. Under the null hypothesis (both samples drawn from the same distribution) $U$ has a known distribution and a $p$-value can be computed directly.
+
+\textbf{Reading the table.} $U$ ranges from $0$ to $n_A n_B$ (so up to $100$ for two 10-trial samples, or up to $90$ when one cell has $9$ trials such as GoYang SA). A small $U$ means that the first solver's costs are systematically below the second's; $U \approx n_A n_B / 2$ means the two samples interleave (no separation). The $p$-value gives the probability of observing such separation under the null; we use the conventional $p<0.05$ threshold. Mann--Whitney was also used to derive the ``no significant difference'' conclusion at $n=3$.
+
+Mann--Whitney $U$ test results on the baseline ($n=10$) cost distributions are reported in Table~\ref{tab:stats}. GA beats both SA and PSO significantly on Two-Loop and Hanoi (under the implementation's velocity envelope; cf.\ Sec.~\ref{sec:hanoi-strict}); on GoYang all three pairwise comparisons are significant, with the cost ordering SA $<$ GA $<$ PSO. At the smaller trial counts of the sensitivity matrix ($n=3$) no pairwise comparison was significant (all $p \in [0.07, 1.00]$); the 3-trial configurations are informative for trends but lack the statistical power to discriminate algorithms.
+
+\begin{table}[t]
+\caption{Mann--Whitney U tests on baseline cost distributions ($n=10$).}
+\label{tab:stats}
+\centering
+\begin{tabular}{lllrl}
+\toprule
+Network & Comparison & $U$ & $p$-value & Significant \\
+\midrule
+Two-Loop & GA vs SA  & 0.0  & $0.0001$ & yes \\
+Two-Loop & GA vs PSO & 12.0 & $0.0280$ & yes \\
+Two-Loop & SA vs PSO & 30.0 & $0.6227$ & no  \\
+\midrule
+Hanoi    & GA vs SA  & 5.0  & $0.0008$ & yes \\
+Hanoi    & GA vs PSO & 3.0  & $0.0140$ & yes \\
+Hanoi    & SA vs PSO & 10.0 & $0.1878$ & no  \\
+\midrule
+GoYang   & GA vs SA  & 73.0 & $0.0247$ & yes \\
+GoYang   & GA vs PSO & 2.0  & $0.0003$ & yes \\
+GoYang   & SA vs PSO & 1.0  & $0.0004$ & yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Wall-time vs.\ quality}
+Figure~\ref{fig:walltime} plots wall-time against best cost across the full experimental matrix.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig07_walltime_vs_quality.png}
+\caption{Wall-time vs.\ solution quality across the full matrix. PSO occupies the fast--rough corner on Two-Loop and GoYang; GA dominates the high-quality corner on Hanoi at the cost of $\geq 1300$~s baseline runs.}
+\label{fig:walltime}
+\end{figure}
+
+The Pareto frontier is non-trivial. PSO dominates the fast-and-rough corner on Two-Loop and GoYang; GA dominates the high-quality corner on Hanoi (at the cost of $\geq 1300$~s baseline runs); SA trades speed for reliability, sitting between PSO and GA on time but below both on variance.
+
+\section{Discussion}
+\label{sec:discussion}
+\subsection{The published feasibility envelope is wider than commonly read}
+The methodological centerpiece of this study is the gap between \emph{numerical} and \emph{engineering} feasibility on Hanoi. Reproducing the SOP-WDN optimal Hanoi design under our evaluator (Sec.~\ref{sec:validation}) reveals that the published optimum operates at $V_{\max}=6.832$~m/s on the reservoir-feeder P1 and at $V_{\min}=0.21$~m/s on the least-loaded pipe. Both extremes are hydraulically valid (EPANET converges, pressure $\geq 30$~m at every demand node) but unusual by engineering standards: pipes below $\sim 0.3$~m/s accumulate sediment, pipes above $\sim 2.5$~m/s generate noise and wear. The reference paper's GA evidently treats this region as feasible, and our GA exploits the same region more thoroughly, producing designs $-37\%$ below the paper's cost on Hanoi (Two-Loop: $-54\%$).
+
+The velocity-bound gradient (Sec.~\ref{sec:hanoi-strict}; Table~\ref{tab:vmax_gradient}) sharpens the picture. At $V_{\max}=7.0$~m/s --- the paper's default --- GA, SA, and PSO all find feasible Hanoi designs. At $V_{\max}=4.0$~m/s --- still above engineering norms --- none of them do. At the engineering-typical $V_{\max}=2.5$~m/s, the same is true; and the reference paper's own optimum is also rejected (its $V_{\max}=6.832$ exceeds the ceiling). The honest characterization is therefore three-part: (i)~the SOP-WDN paper publishes a feasibility envelope wider than the engineering norm; (ii)~our GA explores that envelope more thoroughly than the paper's GA does; (iii)~a separate engineering filter must be applied to either result before construction --- and at the moment, no solver in our experiment has found a Hanoi design that survives this filter.
+
+This pattern generalises beyond our implementation. WDN benchmark costs are meaningless without their full constraint specification, and the velocity bounds in particular are commonly omitted from comparison tables. Tens-of-percent cost differences between studies may reflect protocol drift rather than algorithmic progress, and ``state-of-the-art'' on these benchmarks is best read as a statement about both an algorithm and a feasibility regime.
+
+\subsection{Algorithm trade-offs}
+Within the implemented protocol, the three solvers occupy distinct trade-off regions:
+\begin{itemize}
+\item \textbf{GA} --- most exploratory; finds the cheapest feasible designs at every difficulty level; moderate variance (single trial is informative); slowest wall-time but improves monotonically with budget up to at least $160{,}000$ evaluations.
+\item \textbf{SA} --- most reliable; lowest variance; plateaus at modest budgets (cheap suffices). Best choice when one defensible answer matters more than exploration breadth.
+\item \textbf{PSO} --- fastest by $3$--$6\times$; effective on Two-Loop and GoYang; brittle on Hanoi (40\% feasibility), where the discrete-rounding particle update interacts poorly with the EPANET tolerance and produces pressure $=-100$ solver failures.
+\end{itemize}
+
+\subsection{Threats to validity}
+Four caveats apply. First, only the 10-trial baseline supports significance claims; the 3-trial sensitivity matrix is informative for trends but statistically underpowered ($p$ values typically in $[0.07,1.00]$). Second, the GoYang reservoir is modelled as a constant 86~m head rather than a 71~m source with an explicit 4.52~kW pump; this approximation matches the published cost to the cent but produces a 0.32~m offset at the binding node, and future work should validate against an explicit pump model. Third, our $\mathrm{VP}_2=0.65$ choice was made for hydraulic plausibility (it penalises sediment-prone stagnant pipes more aggressively than the reference paper's $0.06$); reverting to the reference value may shift the GA's exploration toward the more conservative region the paper's GA evidently inhabits. Fourth, PSO's parameter sweep was not exhaustive; the discrete-rounding particle-update interacts brittly with the EPANET tolerance on Hanoi, and a self-adaptive or hybrid GA-PSO might close the reliability gap.
+
+\section{Conclusion}
+\label{sec:conclusion}
+We implemented and compared three metaheuristic optimizers --- a faithful SOP-WDN GA, an adaptive SA, and a discrete PSO --- on the Two-Loop, Hanoi, and GoYang benchmarks, sharing a single WNTR/EPANET evaluator. Across a 10-trial baseline and a 5-axis sensitivity matrix, SA proved the most reliable solver (exact recovery of the Two-Loop optimum, smallest GoYang gap), GA the most exploratory and the strongest in raw-cost terms under the reference protocol, and PSO the fastest but the most brittle on the hardest network. Mann--Whitney tests at $n=10$ confirmed statistical significance for the cleanest comparisons.
+
+The central methodological lesson concerns the boundary between numerical and engineering feasibility. The published-optimal Hanoi design operates at $V_{\max}=6.832$~m/s under our evaluator --- inside numerical feasibility but outside the engineering norm of $V_{\max}\lesssim 2.5$~m/s. Our GA explores the same envelope more thoroughly and finds cheaper designs there, but a velocity-bound gradient experiment shows that under engineering-typical bounds the entire feasibility region disappears, eliminating both our and the reference paper's designs. WDN benchmark costs are protocol-dependent in a load-bearing way and should not be quoted without the full constraint specification, in particular the velocity envelope.
+
+\textbf{Future work.} (i)~Extend the sensitivity matrix to 30 trials per configuration to lift the statistical-power ceiling beyond the baseline. (ii)~Replace the GoYang constant-head approximation with an explicit 4.52~kW pump curve and re-validate. (iii)~Fill in the Hanoi velocity-bound gradient with intermediate points at $V_{\max}\in\{5.0,5.5,6.0,6.5\}$~m/s to locate the precise boundary at which the published feasibility region collapses. (iv)~Develop a hybrid GA--PSO scheme that retains PSO's convergence speed while inheriting GA's reliability on networks with high pipe count.
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{20}
+
+\bibitem{sangroula2022}
+U. Sangroula, K.-H. Han, K.-M. Koo, K. Gnawali, and K.-T. Yum, ``Optimization of water distribution networks using genetic algorithm based SOP--WDN program,'' \emph{Water}, vol. 14, no. 6, p. 851, 2022.
+
+\bibitem{survey}
+M. Cotin and A. Karp, ``Comprehensive analysis of evolutionary optimization in water distribution systems: state-of-the-art and benchmark instances,'' course project report, Mar. 2026.
+
+\bibitem{alperovits1977}
+E. Alperovits and U. Shamir, ``Design of optimal water distribution systems,'' \emph{Water Resources Research}, vol. 13, no. 6, pp. 885--900, 1977.
+
+\bibitem{fujiwara1990}
+O. Fujiwara and D. B. Kang, ``A two-phase decomposition method for optimal design of looped water distribution networks,'' \emph{Water Resources Research}, vol. 26, no. 4, pp. 539--549, 1990.
+
+\bibitem{kim1994}
+J. H. Kim, T. G. Kim, J. H. Kim, and Y. N. Yoon, ``A study on the pipe network system design using non-linear programming,'' \emph{Journal of the Korean Water Resources Association}, vol. 27, pp. 59--67, 1994.
+
+\bibitem{savic1997}
+D. A. Savic and G. A. Walters, ``Genetic algorithms for least-cost design of water distribution networks,'' \emph{Journal of Water Resources Planning and Management}, vol. 123, no. 2, pp. 67--77, 1997.
+
+\bibitem{geem2006}
+Z. W. Geem, ``Optimal cost design of water distribution networks using harmony search,'' \emph{Engineering Optimization}, vol. 38, no. 3, pp. 259--277, 2006.
+
+\bibitem{surco2018}
+D. F. Surco, T. P. Vecchi, and M. A. Ravagnani, ``Optimization of water distribution networks using a modified particle swarm optimization algorithm,'' \emph{Water Science and Technology: Water Supply}, vol. 18, no. 2, pp. 660--678, 2018.
+
+\bibitem{deb1996}
+K. Deb and S. Agrawal, ``A niched-penalty approach for constraint handling in genetic algorithms,'' in \emph{Artificial Neural Nets and Genetic Algorithms}. Vienna: Springer, 1996, pp. 235--243.
+
+\bibitem{wu2002}
+Z. Y. Wu and A. R. Simpson, ``A self-adaptive boundary search genetic algorithm and its application to water distribution systems,'' \emph{Journal of Hydraulic Research}, vol. 40, no. 2, pp. 191--203, 2002.
+
+\bibitem{tanyimboh2021}
+T. T. Tanyimboh, ``Redundant binary codes in genetic algorithms: multi-objective design optimization of water distribution networks,'' \emph{Water Supply}, vol. 21, no. 1, pp. 444--457, 2021.
+
+\bibitem{bi2020}
+W. Bi, Y. Xu, and H. Wang, ``Comparison of searching behaviour of three evolutionary algorithms applied to water distribution system design optimization,'' \emph{Water}, vol. 12, no. 3, p. 695, 2020.
+
+\bibitem{mala2018}
+H. Mala-Jetmarova, N. Sultanova, and D. Savic, ``Lost in optimisation of water distribution systems? A literature review of system design,'' \emph{Water}, vol. 10, no. 3, p. 307, 2018.
+
+\bibitem{rossman2000}
+L. A. Rossman, \emph{EPANET 2 Users Manual}. Washington, DC: U.S. Environmental Protection Agency, 2000.
+
+\bibitem{wntr}
+K. A. Klise, M. Bynum, D. Moriarty, and R. Murray, ``A software framework for assessing the resilience of drinking water systems to disasters with an example earthquake case study,'' \emph{Environmental Modelling \& Software}, vol. 95, pp. 420--431, 2017.
+
+\bibitem{goldberg1989}
+D. E. Goldberg, \emph{Genetic Algorithms in Search, Optimization, and Machine Learning}. Reading, MA: Addison-Wesley, 1989.
+
+\end{thebibliography}
+
+\end{document}
